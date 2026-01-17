@@ -1,0 +1,127 @@
+name: Build xformers on Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      # 指定 xformers 的 tag, branch 或 commit hash
+      git_ref:
+        description: 'Git Ref (Tag/Branch/Commit)'
+        required: true
+        default: 'v0.0.33.post2'
+        type: string
+      # 指定 Python 版本
+      python_version:
+        description: 'Python Version'
+        required: true
+        default: '3.11'
+        type: choice
+        options:
+          - '3.10'
+          - '3.11'
+          - '3.12'
+      # 指定 CUDA 版本 (用于 PyTorch index 和 CUDA Toolkit)
+      cuda_version:
+        description: 'CUDA Version (e.g., 11.8, 12.1, 12.4, 13.0)'
+        required: true
+        default: '13.0'
+        type: string
+
+jobs:
+  build_wheels:
+    name: Build for Py${{ inputs.python_version }}-CUDA${{ inputs.cuda_version }}
+    runs-on: windows-2022
+    
+    env:
+      # 显卡架构列表。
+      # 8.0=A100, 8.6=RTX30xx, 8.9=RTX40xx, 9.0=H100/RTX50xx(if applicable for cu130)
+      # 如果编译极慢，可以减少这个列表，只保留你需要的架构
+      TORCH_CUDA_ARCH_LIST: "8.0;8.6;8.9;9.0"
+      # 使用 Ninja 加速构建
+      MAX_JOBS: 4
+      DISTUTILS_USE_SDK: 1
+      # 告诉 xformers 这是一个 wheel 构建
+      XFORMERS_PACKAGE_FROM: "wheel-v${{ inputs.git_ref }}"
+
+    steps:
+      - name: Checkout xformers
+        uses: actions/checkout@v4
+        with:
+          repository: facebookresearch/xformers
+          ref: ${{ inputs.git_ref }}
+          submodules: recursive # xformers 必须拉取子模块 (如 cutlass)
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Setup CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        id: cuda-toolkit
+        with:
+          cuda: ${{ inputs.cuda_version }}
+          # 尝试使用 local 安装方式以获得更好的兼容性
+          method: 'network' 
+          sub-packages: '["nvcc", "cudart", "include", "visual_studio_integration"]'
+
+      - name: Setup MSVC (Visual Studio 2022)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Build Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy ninja wheel setuptools pybind11
+
+      - name: Install PyTorch (Matching CUDA version)
+        shell: bash
+        run: |
+          # 构造 PyTorch 的 Index URL
+          # 去除点号，例如 13.0 -> 130, 12.1 -> 121
+          CUDA_CLEAN=$(echo "${{ inputs.cuda_version }}" | tr -d '.')
+          # 如果是 13.0，可能只有 nightly 版本支持，或者需要特定 url
+          # 这里假设 pytorch 官方 wheel 格式为 cu130
+          
+          echo "Installing PyTorch for CUDA ${CUDA_CLEAN}..."
+          
+          # 注意：PyTorch 官方源可能尚未完全支持 cu130 的 stable 版
+          # 如果 stable 找不到，这里尝试安装 nightly (preview)，否则回退到 stable
+          # 您可以根据实际情况修改下面的 URL 逻辑
+          
+          pip install torch --index-url https://download.pytorch.org/whl/cu${CUDA_CLEAN} || \
+          pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cu${CUDA_CLEAN}
+          
+          # 验证 PyTorch 安装和 CUDA 可用性
+          python -c "import torch; print(f'Torch: {torch.__version__}'); print(f'CUDA Available: {torch.cuda.is_available()}'); print(f'CUDA Version: {torch.version.cuda}')"
+
+      - name: Patch or Fix Environment (Optional)
+        shell: powershell
+        run: |
+          # 某些新版 CUDA 在旧版 MSVC 下可能需要 relaxed-constexpr
+          # 但 Windows-2022 是 MSVC v143+，通常不需要 patch
+          echo "Environment Ready."
+          ls env:
+
+      - name: Build Wheel
+        shell: cmd
+        run: |
+          :: 确保使用 Ninja
+          set CMAKE_GENERATOR=Ninja
+          
+          :: 允许不支持的编译器版本 (防止 NVCC 抱怨 MSVC 版本过新)
+          set NVCC_FLAGS=-allow-unsupported-compiler
+          
+          :: 开始构建
+          python setup.py bdist_wheel
+
+      - name: List Artifacts
+        shell: bash
+        run: ls -R dist/
+
+      - name: Upload Wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: xformers-windows-cu${{ inputs.cuda_version }}-cp${{ inputs.python_version }}
+          path: dist/*.whl
