@@ -23,7 +23,7 @@ on:
       cuda_version:
         description: 'CUDA Version (e.g., 11.8, 12.1, 12.4, 13.0)'
         required: true
-        default: '13.0'
+        default: '13.0.0'
         type: string
 
 jobs:
