@@ -133,8 +133,8 @@ jobs:
           
           # 策略：先尝试 Nightly (因为 cu130 很新)，如果失败尝试 Test/Pre，最后尝试 Stable
           # 如果您确定只需要 Nightly，可以简化这行
-          pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cu${CU_VER} || \
-          pip install torch --index-url https://download.pytorch.org/whl/cu${CU_VER}
+          pip install torch --index-url https://download.pytorch.org/whl/cu${CU_VER} || \
+          pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cu${CU_VER}
           
           python -c "import torch; print(f'Torch Ver: {torch.__version__}'); print(f'CUDA Ver: {torch.version.cuda}')"
 
