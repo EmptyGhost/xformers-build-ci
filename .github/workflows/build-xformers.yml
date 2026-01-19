@@ -1,4 +1,4 @@
-name: Build xformers on Windows (Optimized)
+name: Build xformers Windows (Final Optimized)
 
 on:
   workflow_dispatch:
@@ -26,107 +26,85 @@ on:
 jobs:
   build_wheels:
     name: Win-Py${{ inputs.python_version }}-cu${{ inputs.cuda_short_version }}
-    runs-on: windows-2022 # 默认包含 MSVC 2022
+    runs-on: windows-2022
     
     env:
-      # 基础环境变量
+      # [新] 强制开启 CUDA 构建
+      FORCE_CUDA: 1
+      # [新] 指定 Release 模式
+      XFORMERS_BUILD_TYPE: "Release"
+      # [新] 极为重要：设置极短的临时目录以避免 Windows 路径过长报错
+      TMPDIR: "./x"
+      
       MAX_JOBS: 4
       DISTUTILS_USE_SDK: 1
-      # 告诉 xformers setup.py 这是一个 wheel 构建，并指定版本来源
       XFORMERS_PACKAGE_FROM: "wheel-${{ inputs.git_ref }}"
-      # 允许 NVCC 处理新版 MSVC
       NVCC_FLAGS: "-allow-unsupported-compiler"
 
     steps:
-      # 1. 基础环境配置 (官方步骤: Enable Windows long paths)
       - name: Enable Windows long paths
         run: git config --system core.longpaths true
 
-      # 2. 解析 CUDA 版本与设置架构列表 (复刻官方逻辑)
+      # [新] 创建短临时目录 (Workaround for longpaths)
+      - name: Create Short Temp Dir
+        shell: bash
+        run: |
+          mkdir -p x
+          echo "Created temp dir at ./x"
+          # 验证路径长度是否足够短
+          python -c "import os; print(f'Temp dir: {os.path.abspath(\"./x\")}')"
+
       - name: Resolve CUDA & Arch Info
         id: setup_info
         shell: python
         run: |
-          import os
-          import sys
-
+          import os, sys
           cu_short = "${{ inputs.cuda_short_version }}"
           
-          # 1. 版本映射
+          # 版本映射
           version_map = {
-            "130": "13.0.1",
-            "129": "12.9.1",
-            "128": "12.8.1",
-            "126": "12.8.1", # xformers 官方策略：用 12.8 构建 12.6
-            "124": "12.4.1",
-            "121": "12.1.1",
-            "118": "11.8.0"
+            "130": "13.0.1", "129": "12.9.1", "128": "12.8.1",
+            "126": "12.8.1", "124": "12.4.1", "121": "12.1.1", "118": "11.8.0"
           }
-          
           full_version = version_map.get(cu_short)
           if not full_version:
-              print(f"::error::Unknown CUDA short version {cu_short}")
+              print(f"::error::Unknown CUDA version {cu_short}")
               sys.exit(1)
 
-          # 2. 动态设置显卡架构 (移植自官方 workflow_call)
-          # 注意：xformers 内部会解析这些架构字符串
-          base_arch = "7.5 8.0+PTX" # 基础支持 Turning + Ampere
-          arch_list = ""
-          
-          cu_int = int(cu_short)
-          
-          if cu_int >= 130:
-              # CUDA 13.0+: 官方添加了 Hopper(9.0a), Blackwell(10.0a) 等
+          # 架构列表
+          base_arch = "7.5 8.0+PTX"
+          if int(cu_short) >= 130:
               arch_list = f"{base_arch} 9.0a 10.0a 10.3a 11.0a 12.0a 12.1a"
-          elif cu_int >= 120:
-              # CUDA 12.x: 添加 Ada(8.9), Hopper(9.0a)
+          elif int(cu_short) >= 120:
               arch_list = f"{base_arch} 8.6 8.9 9.0a"
           else:
-              # CUDA 11.x
               arch_list = f"{base_arch} 8.6"
 
-          # 3. 写入 Output 和 Env
           with open(os.environ['GITHUB_OUTPUT'], "a") as fp:
               fp.write(f"CUDA_VERSION={full_version}\n")
-              
           with open(os.environ['GITHUB_ENV'], "a") as fp:
               fp.write(f"TORCH_CUDA_ARCH_LIST={arch_list}\n")
-              
-          print(f"Target CUDA: {full_version}")
-          print(f"Target Archs: {arch_list}")
 
-      # 3. 安装 CUDA Toolkit (官方目前针对 Windows 的最佳实践)
       - name: Install CUDA Toolkit
         uses: N-Storm/cuda-toolkit@v0.2.28
         with:
           cuda: ${{ steps.setup_info.outputs.CUDA_VERSION }}
           method: network
 
-      # 4. 设置 CUDA 环境变量
-      - name: Setup CUDA Environment
-        shell: bash
-        run: |
-          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> ${GITHUB_ENV}
-          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> ${GITHUB_ENV}
-
-      # 5. 安装 Python
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: ${{ inputs.python_version }}
 
-      # 6. 配置 MSVC 环境
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # 7. 解决 Windows 链接器冲突 (关键步骤: 移除 Git Bash 的 link.exe)
       - name: Remove link.exe
         shell: bash
         run: rm /usr/bin/link
 
-      # 8. 检出代码
       - name: Checkout xformers
         uses: actions/checkout@v4
         with:
@@ -135,65 +113,49 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # 9. 官方针对 Windows Cutlass 的修复 (HACKFIX)
-      # 某些旧版 Cutlass 在 Windows 上有头文件包含问题
-      - name: HACKFIX for cutlass compiler bug
+      - name: HACKFIX for cutlass
         shell: bash
         run: |
-          TARGET_FILE="third_party/cutlass/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp"
-          if [ -f "$TARGET_FILE" ]; then
-            echo "Applying Cutlass fix..."
-            rm -f "$TARGET_FILE"
-            touch "$TARGET_FILE"
-          else
-            echo "Target file not found, skipping hackfix (maybe older version)."
-          fi
+          TARGET="third_party/cutlass/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp"
+          if [ -f "$TARGET" ]; then rm -f "$TARGET" && touch "$TARGET"; fi
 
-      # 10. 安装构建依赖和 PyTorch
       - name: Install Dependencies & PyTorch
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          # 安装构建工具
           pip install ninja wheel setuptools numpy
           
           CU_VER="${{ inputs.cuda_short_version }}"
+          echo "Installing PyTorch for cu$CU_VER..."
           
-          echo ">>> Installing PyTorch for CUDA ${CU_VER}..."
-          
-          # 定义索引 URL
+          # 优先安装顺序：Stable -> Nightly -> Test
+          # 针对 cu130，Nightly 成功率最高
           URL_STABLE="https://download.pytorch.org/whl/cu${CU_VER}"
-          URL_TEST="https://download.pytorch.org/whl/test/cu${CU_VER}"
           URL_NIGHTLY="https://download.pytorch.org/whl/nightly/cu${CU_VER}"
-          
-          # 尝试安装逻辑：
-          # 1. 尝试 Stable (标准版)
-          # 2. 失败则尝试 Nightly (通常 cu130 需要这个)
-          # 3. 失败则尝试 Test
-          # 4. 这里的逻辑是 || (OR)，如果前一个成功，后续不执行
           
           (pip install torch --index-url $URL_STABLE) || \
           (pip install torch --pre --index-url $URL_NIGHTLY) || \
-          (pip install torch --pre --index-url $URL_TEST)
+          (pip install torch --pre --index-url https://download.pytorch.org/whl/test/cu${CU_VER})
           
-          # 验证
-          python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}, Arch: {torch.cuda.get_arch_list()}')"
+          python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}')"
 
-      # 11. 编译 Wheel
       - name: Build Wheel
         shell: cmd
         run: |
-          :: 强制使用 Ninja 生成器
           set CMAKE_GENERATOR=Ninja
-          
-          echo Building xformers wheel...
           python setup.py bdist_wheel
 
-      # 12. 上传产物
-      - name: List Artifacts
+      # [新] 验证步骤：安装生成的包并检查是否能导入
+      - name: Verify Build
         shell: bash
-        run: ls -R dist/
-        
+        run: |
+          pip install dist/*.whl
+          
+          echo "Running xformers info..."
+          # 切换出源码目录以防止导入冲突
+          cd ..
+          XFORMERS_MORE_DETAILS=1 python -m xformers.info
+
       - name: Upload Wheel
         uses: actions/upload-artifact@v4
         with:
