@@ -1,4 +1,4 @@
-name: Build xformers Windows (Final Optimized)
+name: Build xformers Windows (Flexible Version)
 
 on:
   workflow_dispatch:
@@ -11,33 +11,35 @@ on:
       python_version:
         description: 'Python Version'
         required: true
-        default: '3.11'
+        default: '3.13'
         type: choice
         options:
           - '3.10'
           - '3.11'
           - '3.12'
           - '3.13'
-          - '3.14'
       cuda_short_version:
-        description: 'CUDA Short Version (e.g. 130, 126, 118)'
+        description: 'CUDA Short Version (e.g. 130, 126)'
         required: true
         default: '130'
+        type: string
+      # [修改] 默认值为 "latest"，允许输入 specific version 或 "None"
+      pytorch_version:
+        description: 'PyTorch Version (e.g. 2.10.0). Type "latest" or "None" for auto-detect.'
+        required: false
+        default: 'latest'
         type: string
 
 jobs:
   build_wheels:
-    name: Win-Py${{ inputs.python_version }}-cu${{ inputs.cuda_short_version }}
+    name: Win-Py${{ inputs.python_version }}-cu${{ inputs.cuda_short_version }}-${{ inputs.pytorch_version }}
     runs-on: windows-2022
     
     env:
-      # [新] 强制开启 CUDA 构建
       FORCE_CUDA: 1
-      # [新] 指定 Release 模式
       XFORMERS_BUILD_TYPE: "Release"
-      # [新] 极为重要：设置极短的临时目录以避免 Windows 路径过长报错
+      XFORMERS_ENABLE_FLASHATTENTION: "1"
       TMPDIR: "./x"
-      
       MAX_JOBS: 4
       DISTUTILS_USE_SDK: 1
       XFORMERS_PACKAGE_FROM: "wheel-${{ inputs.git_ref }}"
@@ -47,14 +49,68 @@ jobs:
       - name: Enable Windows long paths
         run: git config --system core.longpaths true
 
-      # [新] 创建短临时目录 (Workaround for longpaths)
       - name: Create Short Temp Dir
         shell: bash
+        run: mkdir -p x
+
+      # [修改] 解析版本逻辑：支持 "None/latest"
+      - name: Resolve Versions
+        id: ver_map
+        shell: python
         run: |
-          mkdir -p x
-          echo "Created temp dir at ./x"
-          # 验证路径长度是否足够短
-          python -c "import os; print(f'Temp dir: {os.path.abspath(\"./x\")}')"
+          import os
+          
+          # 去除空格并转小写
+          raw_input = "${{ inputs.pytorch_version }}".strip()
+          pt_ver = raw_input
+          
+          # 定义 "不指定版本" 的关键词
+          if raw_input.lower() in ["none", "latest", "", "null"]:
+              print("::notice::No specific PyTorch version requested. Will install latest available.")
+              # 设置标记，后续步骤会识别 'latest'
+              pt_ver = "latest"
+              vision_ver = ""
+              audio_ver = ""
+          else:
+              # === 具体的版本映射逻辑 ===
+              future_map = {
+                  "2.10.0": ("0.25.0", "2.10.0"),
+                  "2.9.1":  ("0.24.1", "2.9.1"),
+                  "2.9.0":  ("0.24.0", "2.9.0"),
+                  "2.8.0":  ("0.23.0", "2.8.0"),
+                  "2.7.1":  ("0.22.1", "2.7.1"),
+                  "2.7.0":  ("0.22.0", "2.7.0"),
+                  "2.6.0":  ("0.21.0", "2.6.0"),
+              }
+              history_map = {
+                  "2.5.1": ("0.20.1", "2.5.1"),
+                  "2.5.0": ("0.20.0", "2.5.0"),
+                  "2.4.1": ("0.19.1", "2.4.1"),
+                  "2.4.0": ("0.19.0", "2.4.0"),
+                  "2.3.1": ("0.18.1", "2.3.1"),
+                  "2.3.0": ("0.18.0", "2.3.0"),
+                  "2.2.2": ("0.17.2", "2.2.2"),
+                  "2.2.1": ("0.17.1", "2.2.1"),
+                  "2.2.0": ("0.17.0", "2.2.0"),
+                  "2.1.2": ("0.16.2", "2.1.2"),
+                  "2.1.0": ("0.16.0", "2.1.0"),
+                  "2.0.1": ("0.15.2", "2.0.2"),
+                  "2.0.0": ("0.15.0", "2.0.0"),
+              }
+              full_map = {**future_map, **history_map}
+              
+              if pt_ver in full_map:
+                  vision_ver, audio_ver = full_map[pt_ver]
+                  print(f"Mapped {pt_ver} -> Vision: {vision_ver}, Audio: {audio_ver}")
+              else:
+                  print(f"::warning::No explicit mapping found for {pt_ver}. Will try to install specific torch version only.")
+                  vision_ver = ""
+                  audio_ver = ""
+
+          with open(os.environ['GITHUB_OUTPUT'], "a") as fp:
+              fp.write(f"PT_VER={pt_ver}\n")
+              fp.write(f"VISION_VER={vision_ver}\n")
+              fp.write(f"AUDIO_VER={audio_ver}\n")
 
       - name: Resolve CUDA & Arch Info
         id: setup_info
@@ -62,25 +118,19 @@ jobs:
         run: |
           import os, sys
           cu_short = "${{ inputs.cuda_short_version }}"
-          
-          # 版本映射
           version_map = {
-            "130": "13.0.1", "129": "12.9.1", "128": "12.8.1",
-            "126": "12.8.1", "124": "12.4.1", "121": "12.1.1", "118": "11.8.0"
+            "130": "13.0.1", "128": "12.8.1", "126": "12.8.1", 
+            "124": "12.4.1", "121": "12.1.1", "118": "11.8.0"
           }
-          full_version = version_map.get(cu_short)
-          if not full_version:
-              print(f"::error::Unknown CUDA version {cu_short}")
-              sys.exit(1)
-
-          # 架构列表
+          full_version = version_map.get(cu_short, "13.0.1") 
           base_arch = "7.5 8.0+PTX"
-          if int(cu_short) >= 130:
-              arch_list = f"{base_arch} 9.0a 10.0a 10.3a 11.0a 12.0a 12.1a"
-          elif int(cu_short) >= 120:
+          # 包含 8.6(30系) 8.9(40系)
+          if int(cu_short) >= 120:
               arch_list = f"{base_arch} 8.6 8.9 9.0a"
           else:
               arch_list = f"{base_arch} 8.6"
+          if int(cu_short) >= 130:
+               arch_list += " 10.0a 10.3a 11.0a 12.0a 12.1a"
 
           with open(os.environ['GITHUB_OUTPUT'], "a") as fp:
               fp.write(f"CUDA_VERSION={full_version}\n")
@@ -115,31 +165,46 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: HACKFIX for cutlass
-        shell: bash
-        run: |
-          TARGET="third_party/cutlass/include/cutlass/gemm/kernel/sm90_gemm_tma_warpspecialized_pingpong.hpp"
-          if [ -f "$TARGET" ]; then rm -f "$TARGET" && touch "$TARGET"; fi
-
+      # [修改] 安装步骤：根据是否为 latest 动态构建命令
       - name: Install Dependencies & PyTorch
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install ninja wheel setuptools numpy
+          pip install ninja wheel setuptools numpy packaging
           
           CU_VER="${{ inputs.cuda_short_version }}"
-          echo "Installing PyTorch for cu$CU_VER..."
+          PT="${{ steps.ver_map.outputs.PT_VER }}"
+          VIS="${{ steps.ver_map.outputs.VISION_VER }}"
+          AUD="${{ steps.ver_map.outputs.AUDIO_VER }}"
           
-          # 优先安装顺序：Stable -> Nightly -> Test
-          # 针对 cu130，Nightly 成功率最高
+          # === 构建安装命令 ===
+          if [ "$PT" == "latest" ]; then
+              echo "Mode: LATEST (Auto-detect)"
+              # 不指定版本号，让 pip 自己去 index-url 找最新的
+              INSTALL_CMD="torch torchvision torchaudio"
+          else
+              echo "Mode: FIXED VERSION ($PT)"
+              INSTALL_CMD="torch==$PT"
+              if [ ! -z "$VIS" ]; then INSTALL_CMD="$INSTALL_CMD torchvision==$VIS"; fi
+              if [ ! -z "$AUD" ]; then INSTALL_CMD="$INSTALL_CMD torchaudio==$AUD"; fi
+          fi
+          
+          echo "Run Install: $INSTALL_CMD"
+          
           URL_STABLE="https://download.pytorch.org/whl/cu${CU_VER}"
           URL_NIGHTLY="https://download.pytorch.org/whl/nightly/cu${CU_VER}"
+          URL_TEST="https://download.pytorch.org/whl/test/cu${CU_VER}"
           
-          (pip install torch --index-url $URL_STABLE) || \
-          (pip install torch --pre --index-url $URL_NIGHTLY) || \
-          (pip install torch --pre --index-url https://download.pytorch.org/whl/test/cu${CU_VER})
+          # === 安装尝试逻辑 ===
+          # 1. 尝试 Stable (Release版)
+          # 2. 尝试 Nightly (如果 Stable 没找到，比如 CUDA 13.0 通常只在 Nightly)
+          # 3. 尝试 Test
           
-          python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}')"
+          (pip install $INSTALL_CMD --index-url $URL_STABLE) || \
+          (pip install $INSTALL_CMD --pre --index-url $URL_NIGHTLY) || \
+          (pip install $INSTALL_CMD --pre --index-url $URL_TEST) || \
+          (echo "::error::Failed to install PyTorch" && exit 1)
+          
+          python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}, Arch: {torch.cuda.get_arch_list()}')"
 
       - name: Build Wheel
         shell: cmd
@@ -147,19 +212,15 @@ jobs:
           set CMAKE_GENERATOR=Ninja
           python setup.py bdist_wheel
 
-      # [新] 验证步骤：安装生成的包并检查是否能导入
       - name: Verify Build
         shell: bash
         run: |
           pip install dist/*.whl
-          
-          echo "Running xformers info..."
-          # 切换出源码目录以防止导入冲突
           cd ..
           XFORMERS_MORE_DETAILS=1 python -m xformers.info
 
       - name: Upload Wheel
         uses: actions/upload-artifact@v4
         with:
-          name: xformers-win-cu${{ inputs.cuda_short_version }}-py${{ inputs.python_version }}
+          name: xformers-win-cu${{ inputs.cuda_short_version }}-py${{ inputs.python_version }}-torch${{ inputs.pytorch_version }}
           path: dist/*.whl
